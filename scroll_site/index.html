@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scroll Animation</title>
+<style>
+  :root {
+    color-scheme: dark;
+  }
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    background: #000;
+    overscroll-behavior: none;
+    -webkit-font-smoothing: antialiased;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  html::-webkit-scrollbar,
+  body::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+
+  /* Fixed full-screen canvas stage */
+  #stage {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    display: block;
+    background: #000;
+    opacity: 0;
+    will-change: transform;
+    transform: translateZ(0);
+    transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  #stage.ready {
+    opacity: 1;
+  }
+
+  /* Scroll track defining total scroll distance */
+  #track {
+    height: 800vh;
+    pointer-events: none;
+    visibility: hidden;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="track"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  const TOTAL_FRAMES = 300;
+  const CONCURRENCY = 6;
+  const FRAME_PATH = i => `frames/frame_${String(i + 1).padStart(4, '0')}.jpg`;
+
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+
+  const frames = new Array(TOTAL_FRAMES).fill(null);
+  const requested = new Uint8Array(TOTAL_FRAMES);
+
+  let canvasW = 0;
+  let canvasH = 0;
+  let dpr = 1;
+  let lastRenderedIndex = -1;
+
+  /* ---------- Resize Handling (HiDPI / Retina aware) ---------- */
+  function onResize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    canvasW = Math.round(vw * dpr);
+    canvasH = Math.round(vh * dpr);
+
+    if (canvas.width !== canvasW || canvas.height !== canvasH) {
+      canvas.width = canvasW;
+      canvas.height = canvasH;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      lastRenderedIndex = -1;
+      renderCurrentFrame();
+    }
+  }
+  window.addEventListener('resize', onResize, { passive: true });
+  window.addEventListener('orientationchange', onResize, { passive: true });
+
+  /* ---------- High Quality Cover-Fit Draw ---------- */
+  function drawImageCover(img) {
+    if (!img) return;
+    const cw = canvas.width;
+    const ch = canvas.height;
+    const iw = img.naturalWidth || 1920;
+    const ih = img.naturalHeight || 1080;
+
+    const scale = Math.max(cw / iw, ch / ih);
+    const dw = iw * scale;
+    const dh = ih * scale;
+    const dx = (cw - dw) * 0.5;
+    const dy = (ch - dh) * 0.5;
+
+    ctx.drawImage(img, dx, dy, dw, dh);
+  }
+
+  /* ---------- Find Best Loaded Frame ---------- */
+  function findBestFrameIndex(idealIndex) {
+    if (frames[idealIndex]) return idealIndex;
+    for (let offset = 1; offset < TOTAL_FRAMES; offset++) {
+      const prev = idealIndex - offset;
+      if (prev >= 0 && frames[prev]) return prev;
+      const next = idealIndex + offset;
+      if (next < TOTAL_FRAMES && frames[next]) return next;
+    }
+    return -1;
+  }
+
+  function renderCurrentFrame() {
+    const ideal = Math.min(TOTAL_FRAMES - 1, Math.max(0, Math.round(currentProgress)));
+    const best = findBestFrameIndex(ideal);
+    if (best < 0) return;
+
+    if (best !== lastRenderedIndex) {
+      drawImageCover(frames[best]);
+      lastRenderedIndex = best;
+    }
+  }
+
+  /* ---------- Scroll Mapping & Physics ---------- */
+  let targetProgress = 0;
+  let currentProgress = 0;
+  let lastTime = performance.now();
+  let isTicking = false;
+
+  function updateScrollTarget() {
+    const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+    const ratio = maxScroll > 0 ? Math.min(1, Math.max(0, window.scrollY / maxScroll)) : 0;
+    targetProgress = ratio * (TOTAL_FRAMES - 1);
+    if (!isTicking) {
+      isTicking = true;
+      requestAnimationFrame(tick);
+    }
+  }
+  window.addEventListener('scroll', updateScrollTarget, { passive: true });
+
+  function tick(now) {
+    const dt = Math.min(0.1, (now - lastTime) / 1000);
+    lastTime = now;
+
+    // Snappy yet silky exponential damping
+    const speed = 14;
+    const factor = 1 - Math.exp(-dt * speed);
+    currentProgress += (targetProgress - currentProgress) * factor;
+
+    const delta = Math.abs(targetProgress - currentProgress);
+    if (delta < 0.002) {
+      currentProgress = targetProgress;
+    }
+
+    renderCurrentFrame();
+
+    if (delta >= 0.002) {
+      requestAnimationFrame(tick);
+    } else {
+      isTicking = false;
+    }
+  }
+
+  /* ---------- Dynamic Priority Preloader ---------- */
+  let activeWorkers = 0;
+
+  function getNextIndexToLoad() {
+    let bestIndex = -1;
+    let minDistance = Infinity;
+    const center = Math.round(targetProgress);
+
+    for (let i = 0; i < TOTAL_FRAMES; i++) {
+      if (!requested[i]) {
+        const dist = Math.abs(i - center);
+        if (dist < minDistance) {
+          minDistance = dist;
+          bestIndex = i;
+        }
+      }
+    }
+    return bestIndex;
+  }
+
+  function spawnWorker() {
+    if (activeWorkers >= CONCURRENCY) return;
+    const nextIdx = getNextIndexToLoad();
+    if (nextIdx === -1) return;
+
+    requested[nextIdx] = 1;
+    activeWorkers++;
+
+    const img = new Image();
+    img.decoding = 'async';
+    img.src = FRAME_PATH(nextIdx);
+
+    const onDone = () => {
+      activeWorkers--;
+      // Asynchronously decode off main thread before committing
+      img.decode().then(() => {
+        frames[nextIdx] = img;
+        if (nextIdx === 0 && !canvas.classList.contains('ready')) {
+          canvas.classList.add('ready');
+          renderCurrentFrame();
+        } else {
+          const currentTarget = Math.round(currentProgress);
+          if (Math.abs(nextIdx - currentTarget) <= 1) {
+            renderCurrentFrame();
+          }
+        }
+      }).catch(() => {
+        frames[nextIdx] = img;
+      }).finally(() => {
+        spawnWorker();
+      });
+    };
+
+    img.onload = onDone;
+    img.onerror = () => {
+      activeWorkers--;
+      spawnWorker();
+    };
+  }
+
+  function pumpLoader() {
+    while (activeWorkers < CONCURRENCY) {
+      const idx = getNextIndexToLoad();
+      if (idx === -1) break;
+      spawnWorker();
+    }
+  }
+
+  // When scroll moves, re-pump loader so frames near new target get fetched
+  window.addEventListener('scroll', pumpLoader, { passive: true });
+
+  /* ---------- Initialization ---------- */
+  if ('scrollRestoration' in history) {
+    history.scrollRestoration = 'manual';
+  }
+  window.scrollTo(0, 0);
+
+  onResize();
+  updateScrollTarget();
+  currentProgress = targetProgress;
+
+  // Initial load: fetch frame 0 immediately
+  requested[0] = 1;
+  activeWorkers++;
+  const firstImg = new Image();
+  firstImg.decoding = 'async';
+  firstImg.src = FRAME_PATH(0);
+  firstImg.onload = () => {
+    activeWorkers--;
+    firstImg.decode().then(() => {
+      frames[0] = firstImg;
+      canvas.classList.add('ready');
+      renderCurrentFrame();
+    }).catch(() => {
+      frames[0] = firstImg;
+      canvas.classList.add('ready');
+      renderCurrentFrame();
+    }).finally(() => {
+      pumpLoader();
+    });
+  };
+  firstImg.onerror = () => {
+    activeWorkers--;
+    pumpLoader();
+  };
+})();
+</script>
+</body>
+</html>
